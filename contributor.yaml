@@ -1,0 +1,26 @@
+name: "XPulse"
+description: "Plugin de notifications temps-réel — SSE multi-channel, pub/sub Redis, broadcast."
+author: "Xcore team"
+email: "contact@xcorehub.dev"
+github: "https://github.com/xcore-team/xpulse"
+license: "MIT"
+version: "0.1.0"
+
+contributors:
+  - name: "Eliezer Traore"
+    role: "Mainteneur principal"
+    github: "traoreera"
+    email: "traoreera@gmail.com"
+    areas:
+      - sse
+      - redis
+      - pubsub
+      - notifications
+
+  - name: "Xcore"
+    role: "Organisation"
+    github: "xcore-team"
+    email: "xcore@xcorehub.dev"
+    areas:
+      - review
+      - merge

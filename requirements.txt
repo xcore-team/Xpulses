@@ -1,0 +1,8 @@
+# XPulse — dépendances Python
+# Généré depuis l'analyse des imports du plugin
+
+# Web framework
+fastapi>=0.111.0
+
+# Redis asyncio (pub/sub + pool de connexions)
+redis[hiredis]>=5.0.0
