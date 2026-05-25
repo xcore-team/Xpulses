@@ -1,0 +1,61 @@
+name: XPulse
+version: 0.1.0
+author: xcore team's
+description: >
+  XPulse est un systeme de notification realtime
+
+execution_mode: trusted
+entry_point: src/main.py
+
+#requires:
+#  - name: auth
+#    version: ">=1.0.0, <1.3.0"
+
+permissions:
+  - resource: "xpulse.publish"
+    actions: ["*"]
+    effect: "allow"
+  - resource: "xpulse.broadcast"
+    actions: ["*"]
+    effect: "allow"
+  - resource: "xpulse.email"
+    actions: ["*"]
+    effect: "allow"
+
+resources:
+  timeout_seconds: 10
+  max_memory_mb: 100
+  max_disk_mb: 1
+  rate_limit:
+    calls: 100
+    period_seconds: 60
+
+runtime:
+  health_check:
+    enabled: true
+    interval_seconds: 60
+    timeout_seconds: 3
+
+  retry:
+    max_attempts: 3
+    backoff_seconds: 3.0
+
+envconfiguration:
+  inject: true
+  env_file: .env.example
+
+env:
+  url: redis://localhost:6379/0
+  channel: ["notification", "system", "alerts"]
+  MAX_CONCURRENT_STREAMS: ${MAX_CONCURRENT_STREAMS}
+  MAX_CHANNELS_PER_STREAM: ${MAX_CHANNELS_PER_STREAM}
+  HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL}
+  MESSAGE_TIMEOUT: ${MESSAGE_TIMEOUT}
+  RECONNECT_MAX_RETRIES: ${RECONNECT_MAX_RETRIES}
+  RECONNECT_BASE_DELAY: ${RECONNECT_BASE_DELAY}
+
+allowed_callers:
+  - auth
+  - xlicense
+  - xflows
+  -
