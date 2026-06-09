@@ -1,4 +1,4 @@
-name: XPulse
+name: xpulse
 version: 0.1.0
 author: xcore team's
 description: >
@@ -55,15 +55,15 @@ runtime:
     backoff_seconds: 3.0
 
 envconfiguration:
-  inject: true
+  inject: false
   env_file: .env
 
 env:
-  url: ${URL}
+  url: redis://localhost:6379/0
   channel: ["notification", "systeme", "hunters", "alerts"]
-  MAX_CONCURRENT_STREAMS: ${MAX_CONCURRENT_STREAMS}
-  MAX_CHANNELS_PER_STREAM: ${MAX_CHANNELS_PER_STREAM}
-  HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL}
-  MESSAGE_TIMEOUT: ${MESSAGE_TIMEOUT}
-  RECONNECT_MAX_RETRIES: ${RECONNECT_MAX_RETRIES}
-  RECONNECT_BASE_DELAY: ${RECONNECT_BASE_DELAY}
+  MAX_CONCURRENT_STREAMS: 10
+  MAX_CHANNELS_PER_STREAM: 10
+  HEARTBEAT_INTERVAL: 10
+  MESSAGE_TIMEOUT: 10
+  RECONNECT_MAX_RETRIES: 10
+  RECONNECT_BASE_DELAY: 10

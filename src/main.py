@@ -138,11 +138,15 @@ class Plugin(AutoDispatchMixin, RoutedPlugin, TrustedBase):
             Le payload complet est transmis au client SSE (user_id, event, submission_id, etc.)
             """
             if not self.redis_server:
-                logger.warning("ext.notification.publish ignoré : Redis non disponible.")
+                logger.warning(
+                    "ext.notification.publish ignoré : Redis non disponible."
+                )
                 return [error("redis_unavailable")]
 
             data: dict = dict(event.data)
-            raw_channels = data.pop("channels", None) or [data.pop("channel", "notification")]
+            raw_channels = data.pop("channels", None) or [
+                data.pop("channel", "notification")
+            ]
             user_id = data.get("user_id")
 
             if not user_id:
@@ -154,7 +158,9 @@ class Plugin(AutoDispatchMixin, RoutedPlugin, TrustedBase):
                     raw_channels if isinstance(raw_channels, list) else [raw_channels]
                 )
             except InvalidChannel as exc:
-                logger.warning("ext.notification.publish : channels invalides : %s", exc)
+                logger.warning(
+                    "ext.notification.publish : channels invalides : %s", exc
+                )
                 return [error(str(exc))]
 
             # Publie le payload complet (user_id + toutes les données événementielles)
@@ -162,7 +168,9 @@ class Plugin(AutoDispatchMixin, RoutedPlugin, TrustedBase):
             ok_channels = [ch for ch, s in results.items() if s]
             fail_channels = [ch for ch, s in results.items() if not s]
             if fail_channels:
-                logger.warning("ext.notification.publish : channels en échec : %s", fail_channels)
+                logger.warning(
+                    "ext.notification.publish : channels en échec : %s", fail_channels
+                )
             return [ok(channels=ok_channels, failed=fail_channels)]
 
         @self.event.on("ext.notification.broadcast")
@@ -196,7 +204,9 @@ class Plugin(AutoDispatchMixin, RoutedPlugin, TrustedBase):
             ok_channels = [ch for ch, s in results.items() if s]
             fail_channels = [ch for ch, s in results.items() if not s]
             if fail_channels:
-                logger.warning("ext.notification.broadcast : channels en échec : %s", fail_channels)
+                logger.warning(
+                    "ext.notification.broadcast : channels en échec : %s", fail_channels
+                )
             return [ok(channels=ok_channels, failed=fail_channels)]
 
     # ── Routes HTTP ───────────────────────────────────────────────────────
@@ -212,36 +222,44 @@ class Plugin(AutoDispatchMixin, RoutedPlugin, TrustedBase):
     ):
         """
         SSE multi-channel — ouvre un stream pour l'utilisateur authentifié.
-
-        Chaque event SSE est typé par le nom du channel :
-            event: notification
-            data: {"channel": "notification", "user_id": "...", "text": "..."}
-
-        Usage JS :
-            const src = new EventSource('/stream?channels=notification,alerts', { withCredentials: true });
-            src.addEventListener('notification', e => console.log(JSON.parse(e.data)));
+        À l'ouverture, les messages en inbox (envoyés hors-ligne) sont délivrés en premier.
         """
         redis = self._require_redis()
         user_id: str = current_user.get("sub", None)
-        
-        
+
         if not user_id:
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Token invalide.{current_user}"
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Token invalide.{current_user}",
             )
-            
 
         parsed_channels = self._parse_channels(channels)
 
-        try:
-            generator = redis.stream(channels=parsed_channels, user_id=user_id)
-        except StreamLimitExceeded as exc:
+        # Vérifie la limite de streams avant d'ouvrir
+        if redis._active_streams >= redis._config.MAX_CONCURRENT_STREAMS:
             raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Trop de connexions simultanées ({redis._config.MAX_CONCURRENT_STREAMS} max).",
             )
 
+        # Récupère les messages manqués avant d'ouvrir le stream live
+        pending = await redis.flush_inbox(user_id)
+
+        async def stream_with_inbox():
+            import json as _json
+            # 1. Livraison de l'inbox (messages envoyés hors-ligne)
+            for msg in pending:
+                ch = msg.get("channel", "notification")
+                yield (
+                    f"event: {ch}\n"
+                    f"data: {_json.dumps(msg, ensure_ascii=False)}\n\n"
+                )
+            # 2. Stream live continu
+            async for chunk in redis.stream(channels=parsed_channels, user_id=user_id):
+                yield chunk
+
         return StreamingResponse(
-            generator,
+            stream_with_inbox(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -249,6 +267,31 @@ class Plugin(AutoDispatchMixin, RoutedPlugin, TrustedBase):
                 "Connection": "keep-alive",
             },
         )
+
+    @router.get("/inbox", tags=["xpulse"])
+    async def get_inbox(
+        self,
+        current_user: AuthPayload = Depends(get_current_user),
+    ):
+        """
+        Retourne et vide les messages en attente (envoyés quand l'user était hors-ligne).
+        Utile pour les clients qui ne gardent pas le SSE ouvert en permanence.
+        """
+        redis = self._require_redis()
+        user_id: str = current_user.get("sub", "")
+        messages = await redis.flush_inbox(user_id)
+        return {"messages": messages, "count": len(messages)}
+
+    @router.get("/inbox/count", tags=["xpulse"])
+    async def inbox_count(
+        self,
+        current_user: AuthPayload = Depends(get_current_user),
+    ):
+        """Nombre de messages en attente sans les consommer."""
+        redis = self._require_redis()
+        user_id: str = current_user.get("sub", "")
+        count = await redis.inbox_count(user_id)
+        return {"count": count}
 
     @router.post("/publish", tags=["xpulse"])
     async def publish(

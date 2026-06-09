@@ -108,8 +108,69 @@ class RedisPubSubManager:
     # PUBLISHER
     # ─────────────────────────────────────────────
 
+    # ─────────────────────────────────────────────
+    # INBOX (rétention des messages hors-ligne)
+    # ─────────────────────────────────────────────
+
+    INBOX_PREFIX = "inbox"
+    INBOX_TTL = 7 * 24 * 3600   # 7 jours
+    INBOX_MAX = 200              # messages max par user
+
+    def _inbox_key(self, user_id: str) -> str:
+        return f"{self.INBOX_PREFIX}:{user_id}"
+
+    async def push_to_inbox(self, user_id: str, channel: str, event: dict) -> None:
+        """Stocke un message dans la liste inbox de l'user (LPUSH + trim + TTL)."""
+        if not self.redis:
+            return
+        key = self._inbox_key(user_id)
+        entry = json.dumps({**event, "channel": channel}, ensure_ascii=False)
+        try:
+            await self.redis.lpush(key, entry)
+            await self.redis.ltrim(key, 0, self.INBOX_MAX - 1)
+            await self.redis.expire(key, self.INBOX_TTL)
+        except RedisError as exc:
+            logger.warning("push_to_inbox user=%s : %s", user_id, exc)
+
+    async def flush_inbox(self, user_id: str) -> list[dict]:
+        """Récupère et vide les messages en attente pour l'user."""
+        if not self.redis:
+            return []
+        key = self._inbox_key(user_id)
+        try:
+            raw_messages = await self.redis.lrange(key, 0, -1)
+            if raw_messages:
+                await self.redis.delete(key)
+            # LPUSH = newest first, on inverse pour ordre chronologique
+            result = []
+            for raw in reversed(raw_messages):
+                try:
+                    result.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    pass
+            return result
+        except RedisError as exc:
+            logger.warning("flush_inbox user=%s : %s", user_id, exc)
+            return []
+
+    async def inbox_count(self, user_id: str) -> int:
+        """Retourne le nombre de messages en attente."""
+        if not self.redis:
+            return 0
+        try:
+            return await self.redis.llen(self._inbox_key(user_id))
+        except RedisError:
+            return 0
+
+    # ─────────────────────────────────────────────
+    # PUBLISHER
+    # ─────────────────────────────────────────────
+
     async def publish(self, channel: str, event: dict) -> bool:
-        """Publie un event sur un channel. Retourne True si succès."""
+        """
+        Publie un event sur un channel.
+        Si le message cible un user_id ET qu'aucun abonné n'est actif → stocké en inbox.
+        """
         if not self.redis:
             logger.error("publish() : Redis non initialisé.")
             return False
@@ -117,6 +178,13 @@ class RedisPubSubManager:
             payload = json.dumps(event, ensure_ascii=False)
             receivers = await self.redis.publish(channel, payload)
             logger.debug("Publié sur '%s' → %d abonné(s)", channel, receivers)
+
+            # Aucun abonné actif et message ciblé → inbox
+            user_id = event.get("user_id")
+            if receivers == 0 and user_id:
+                await self.push_to_inbox(user_id, channel, event)
+                logger.debug("Message mis en inbox pour user=%s (0 abonnés)", user_id)
+
             return True
         except (ConnectionError, TimeoutError, RedisError) as exc:
             logger.error("Erreur publish sur '%s' : %s", channel, exc)
