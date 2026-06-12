@@ -7,10 +7,11 @@ from typing import AsyncGenerator, Optional
 from redis.asyncio import Redis
 from redis.asyncio.connection import ConnectionPool
 from redis.exceptions import ConnectionError, RedisError, TimeoutError
+from xcore.sdk import get_logger
 
 from .section import RedisConfiguration
 
-logger = logging.getLogger("xpulse.redis")
+logger = get_logger("xpulse.redis")
 
 
 MAX_CHANNELS_PER_STREAM = (
@@ -113,8 +114,8 @@ class RedisPubSubManager:
     # ─────────────────────────────────────────────
 
     INBOX_PREFIX = "inbox"
-    INBOX_TTL = 7 * 24 * 3600   # 7 jours
-    INBOX_MAX = 200              # messages max par user
+    INBOX_TTL = 7 * 24 * 3600  # 7 jours
+    INBOX_MAX = 200  # messages max par user
 
     def _inbox_key(self, user_id: str) -> str:
         return f"{self.INBOX_PREFIX}:{user_id}"
@@ -302,7 +303,11 @@ class RedisPubSubManager:
                     # Filtrage : si le message a un user_id, on ne le délivre qu'au bon user.
                     # Si le message n'a pas de user_id (broadcast), on le délivre à tous les abonnés.
                     event_user_id = event.get(filter_key)
-                    if user_id is not None and event_user_id is not None and event_user_id != user_id:
+                    if (
+                        user_id is not None
+                        and event_user_id is not None
+                        and event_user_id != user_id
+                    ):
                         continue
 
                     # On injecte le nom du channel dans le payload

@@ -7,9 +7,9 @@ description: >
 execution_mode: trusted
 entry_point: src/main.py
 
-#requires:
-#  - name: auth
-#    version: ">=1.0.0, <1.3.0"
+requires:
+  - name: auth
+    version: ">=1.0.0, <1.3.0"
 
 # ── Imports autorisés ────────────────────────────────────────────────────────
 allowed_imports:
@@ -67,3 +67,25 @@ env:
   MESSAGE_TIMEOUT: 10
   RECONNECT_MAX_RETRIES: 10
   RECONNECT_BASE_DELAY: 10
+
+rbac:
+  grants:
+    - name: xpulse:admin:publish
+      description: "Envoi d'une notification a tout les utilisateurs"
+      tenant_grantable: false
+      group: "notification"
+
+    - name: xpulse:tennant:publish
+      description: "Envoi d'une notification a tout les utilisateurs"
+      tenant_grantable: true
+      group: "notification"
+
+    - name: xpulse:admin:broadcast
+      description: "Envoi d'une notification a tout les utilisateurs"
+      tenant_grantable: false
+      group: "notification"
+
+    - name: xpulse:tennant:broadcast
+      description: "Envoi d'une notification a tout les utilisateurs"
+      tenant_grantable: true
+      group: "notification"

@@ -3,30 +3,32 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from fastapi import Depends, HTTPException, Query, status
-from fastapi.responses import StreamingResponse
-from xcore.kernel.api.rbac import AuthPayload, get_current_user, require_permission
+from fastapi import HTTPException, status
 from xcore.kernel.events import Event
 from xcore.sdk import (
     AutoDispatchMixin,
-    RoutedPlugin,
+    EventMixin,
+    ObservabilityMixin,
     RouterRegistry,
     TrustedBase,
     action,
     error,
+    health_check,
     ok,
+    on_event,
     validate_payload,
 )
 
+from .bridge import register_bridge
 from .client import (
     InvalidChannel,
     RedisConfiguration,
     RedisPubSubManager,
-    StreamLimitExceeded,
     validate_channels,
 )
+from .routes import builder_router
 
 logger = logging.getLogger("xpulse.plugin")
 
@@ -67,20 +69,12 @@ _EMAIL_SCHEMAS = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class Plugin(AutoDispatchMixin, RoutedPlugin, TrustedBase):
+class Plugin(AutoDispatchMixin, EventMixin, ObservabilityMixin, TrustedBase):
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     async def on_load(self) -> None:
         self.event = self.ctx.events
         self.redis_server: RedisPubSubManager | None = None
-
-        @self.ctx.health.register("xpulse.redis")
-        async def redis_health_check():
-            if not self.redis_server:
-                return False, "Redis non configuré."
-            alive = await self.redis_server.health_check()
-            return alive, "Redis répond." if alive else "Redis ne répond pas."
-
         try:
             # self.ctx.env["channel"] = self.ctx.env["channel"].split(",")
             self.redis_server = RedisPubSubManager(
@@ -92,7 +86,13 @@ class Plugin(AutoDispatchMixin, RoutedPlugin, TrustedBase):
             logger.error("xpulse : impossible d'initialiser Redis : %s", exc)
             logger.warning("xpulse démarré en mode dégradé (pas de Redis).")
 
-        await self._register_event_handlers()
+        # Bridge inter-plugins → xpulse : démarre seulement si Redis est up.
+        # En mode dégradé (pas de Redis) le bridge est silencieusement ignoré.
+        if self.redis_server:
+            register_bridge(self.ctx.events, self.redis_server)
+
+        self.app = builder_router(self.redis_server, self.call_plugin)
+        await self._declare_rbac()
 
     async def on_unload(self) -> None:
         if self.redis_server:
@@ -126,231 +126,78 @@ class Plugin(AutoDispatchMixin, RoutedPlugin, TrustedBase):
         return list(raw) if raw else ["notification"]
 
     # ── Event handlers ────────────────────────────────────────────────────
-
-    async def _register_event_handlers(self) -> None:
-
-        @self.event.on("ext.notification.publish")
-        async def handle_publish(event: Event):
-            """
-            Publie sur un ou plusieurs channels pour un user précis.
-            Payload : { "channels": [...], "user_id": "...", ...données }
-                  ou : { "channel": "...", "user_id": "...", ...données }
-            Le payload complet est transmis au client SSE (user_id, event, submission_id, etc.)
-            """
-            if not self.redis_server:
-                logger.warning(
-                    "ext.notification.publish ignoré : Redis non disponible."
-                )
-                return [error("redis_unavailable")]
-
-            data: dict = dict(event.data)
-            raw_channels = data.pop("channels", None) or [
-                data.pop("channel", "notification")
-            ]
-            user_id = data.get("user_id")
-
-            if not user_id:
-                logger.warning("ext.notification.publish : user_id requis.")
-                return [error("missing_fields")]
-
-            try:
-                channels = validate_channels(
-                    raw_channels if isinstance(raw_channels, list) else [raw_channels]
-                )
-            except InvalidChannel as exc:
-                logger.warning(
-                    "ext.notification.publish : channels invalides : %s", exc
-                )
-                return [error(str(exc))]
-
-            # Publie le payload complet (user_id + toutes les données événementielles)
-            results = await self.redis_server.publish_many(channels, data)
-            ok_channels = [ch for ch, s in results.items() if s]
-            fail_channels = [ch for ch, s in results.items() if not s]
-            if fail_channels:
-                logger.warning(
-                    "ext.notification.publish : channels en échec : %s", fail_channels
-                )
-            return [ok(channels=ok_channels, failed=fail_channels)]
-
-        @self.event.on("ext.notification.broadcast")
-        async def handle_broadcast(event: Event):
-            """
-            Broadcast vers tous les subscribers actifs.
-            Payload : { "channels": [...], "text": "...", ...données }
-            Le payload complet (sans user_id) est publié — le stream SSE le délivre
-            à tous les abonnés du channel (messages sans user_id = broadcast).
-            """
-            if not self.redis_server:
-                return [error("redis_unavailable")]
-
-            data: dict = dict(event.data)
-            raw_channels = data.pop("channels", ["notification"])
-
-            if not data:
-                logger.warning("ext.notification.broadcast : payload vide.")
-                return [error("missing_payload")]
-
-            try:
-                channels = validate_channels(
-                    raw_channels if isinstance(raw_channels, list) else [raw_channels]
-                )
-            except InvalidChannel as exc:
-                logger.warning("broadcast : channels invalides : %s", exc)
-                return [error(str(exc))]
-
-            # Publie sans user_id → le stream SSE délivre à tous les abonnés
-            results = await self.redis_server.publish_many(channels, data)
-            ok_channels = [ch for ch, s in results.items() if s]
-            fail_channels = [ch for ch, s in results.items() if not s]
-            if fail_channels:
-                logger.warning(
-                    "ext.notification.broadcast : channels en échec : %s", fail_channels
-                )
-            return [ok(channels=ok_channels, failed=fail_channels)]
-
-    # ── Routes HTTP ───────────────────────────────────────────────────────
-
-    @router.get("/stream", tags=["xpulse"])
-    async def get_stream(
-        self,
-        current_user: AuthPayload = Depends(get_current_user),
-        channels: list[str] = Query(
-            default=["notification"],
-            description="Channel(s) à écouter. Ex: ?channels=notification&channels=alerts",
-        ),
-    ):
+    @on_event("ext.notification.publish")
+    async def handle_publish(self, event: Event):
         """
-        SSE multi-channel — ouvre un stream pour l'utilisateur authentifié.
-        À l'ouverture, les messages en inbox (envoyés hors-ligne) sont délivrés en premier.
+        Publie sur un ou plusieurs channels pour un user précis.
+        Payload : { "channels": [...], "user_id": "...", ...données }
+        ou : { "channel": "...", "user_id": "...", ...données }
+        Le payload complet est transmis au client SSE (user_id, event, submission_id, etc.)
         """
-        redis = self._require_redis()
-        user_id: str = current_user.get("sub", None)
-
+        if not self.redis_server:
+            logger.warning("ext.notification.publish ignoré : Redis non disponible.")
+            return [error("redis_unavailable")]
+        data: dict = dict(event.data)
+        raw_channels = data.pop("channels", None) or [
+            data.pop("channel", "notification")
+        ]
+        user_id = data.get("user_id")
         if not user_id:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Token invalide.{current_user}",
+            logger.warning("ext.notification.publish : user_id requis.")
+            return [error("missing_fields")]
+        try:
+            channels = validate_channels(
+                raw_channels if isinstance(raw_channels, list) else [raw_channels]
             )
+        except InvalidChannel as exc:
+            logger.warning("ext.notification.publish : channels invalides : %s", exc)
+            return [error(str(exc))]
 
-        parsed_channels = self._parse_channels(channels)
-
-        # Vérifie la limite de streams avant d'ouvrir
-        if redis._active_streams >= redis._config.MAX_CONCURRENT_STREAMS:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Trop de connexions simultanées ({redis._config.MAX_CONCURRENT_STREAMS} max).",
+        # Publie le payload complet (user_id + toutes les données événementielles)
+        results = await self.redis_server.publish_many(channels, data)
+        ok_channels = [ch for ch, s in results.items() if s]
+        fail_channels = [ch for ch, s in results.items() if not s]
+        if fail_channels:
+            logger.warning(
+                "ext.notification.publish : channels en échec : %s", fail_channels
             )
+        return [ok(channels=ok_channels, failed=fail_channels)]
 
-        # Récupère les messages manqués avant d'ouvrir le stream live
-        pending = await redis.flush_inbox(user_id)
-
-        async def stream_with_inbox():
-            import json as _json
-            # 1. Livraison de l'inbox (messages envoyés hors-ligne)
-            for msg in pending:
-                ch = msg.get("channel", "notification")
-                yield (
-                    f"event: {ch}\n"
-                    f"data: {_json.dumps(msg, ensure_ascii=False)}\n\n"
-                )
-            # 2. Stream live continu
-            async for chunk in redis.stream(channels=parsed_channels, user_id=user_id):
-                yield chunk
-
-        return StreamingResponse(
-            stream_with_inbox(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "Connection": "keep-alive",
-            },
-        )
-
-    @router.get("/inbox", tags=["xpulse"])
-    async def get_inbox(
-        self,
-        current_user: AuthPayload = Depends(get_current_user),
-    ):
+    @on_event("ext.notification.broadcast")
+    async def handle_broadcast(self, event: Event):
         """
-        Retourne et vide les messages en attente (envoyés quand l'user était hors-ligne).
-        Utile pour les clients qui ne gardent pas le SSE ouvert en permanence.
+        Broadcast vers tous les subscribers actifs.
+        Payload : { "channels": [...], "text": "...", ...données }
+        Le payload complet (sans user_id) est publié — le stream SSE le délivre
+        à tous les abonnés du channel (messages sans user_id = broadcast).
         """
-        redis = self._require_redis()
-        user_id: str = current_user.get("sub", "")
-        messages = await redis.flush_inbox(user_id)
-        return {"messages": messages, "count": len(messages)}
+        if not self.redis_server:
+            return [error("redis_unavailable")]
 
-    @router.get("/inbox/count", tags=["xpulse"])
-    async def inbox_count(
-        self,
-        current_user: AuthPayload = Depends(get_current_user),
-    ):
-        """Nombre de messages en attente sans les consommer."""
-        redis = self._require_redis()
-        user_id: str = current_user.get("sub", "")
-        count = await redis.inbox_count(user_id)
-        return {"count": count}
+        data: dict = dict(event.data)
+        raw_channels = data.pop("channels", ["notification"])
 
-    @router.post("/publish", tags=["xpulse"])
-    async def publish(
-        self,
-        user_id: str = Query(..., description="ID de l'utilisateur cible"),
-        text: str = Query(..., description="Message à envoyer"),
-        channels: list[str] = Query(default=["notification"]),
-        _: AuthPayload = Depends(require_permission("xpulse:publish")),
-    ):
-        """Publie un message ciblé sur un ou plusieurs channels."""
-        redis = self._require_redis()
-        parsed_channels = self._parse_channels(channels)
+        if not data:
+            logger.warning("ext.notification.broadcast : payload vide.")
+            return [error("missing_payload")]
 
-        results = await redis.publish_many(
-            parsed_channels, {"user_id": user_id, "text": text}
-        )
-        failed = [ch for ch, s in results.items() if not s]
-        if failed:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Publish échoué sur : {failed}",
+        try:
+            channels = validate_channels(
+                raw_channels if isinstance(raw_channels, list) else [raw_channels]
             )
-        return {"status": "ok", "channels": parsed_channels}
+        except InvalidChannel as exc:
+            logger.warning("broadcast : channels invalides : %s", exc)
+            return [error(str(exc))]
 
-    @router.post("/broadcast", tags=["xpulse"])
-    async def broadcast(
-        self,
-        text: str = Query(..., description="Message à broadcaster"),
-        channels: list[str] = Query(default=["notification"]),
-        _: AuthPayload = Depends(require_permission("xpulse:broadcast")),
-    ):
-        """Envoie un message à tous les abonnés sur un ou plusieurs channels.
-        Publie sans user_id — le filtre SSE le délivre à tous les abonnés."""
-        redis = self._require_redis()
-        parsed_channels = self._parse_channels(channels)
-
-        results = await redis.publish_many(parsed_channels, {"text": text})
-        failed = [ch for ch, s in results.items() if not s]
-        if failed:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Broadcast échoué sur : {failed}",
+        # Publie sans user_id → le stream SSE délivre à tous les abonnés
+        results = await self.redis_server.publish_many(channels, data)
+        ok_channels = [ch for ch, s in results.items() if s]
+        fail_channels = [ch for ch, s in results.items() if not s]
+        if fail_channels:
+            logger.warning(
+                "ext.notification.broadcast : channels en échec : %s", fail_channels
             )
-        logger.info("Broadcast : channels=%s", parsed_channels)
-        return {"status": "ok", "channels": parsed_channels}
-
-    @router.post("/test-emit", tags=["xpulse"])
-    async def test_emit(self):
-        await self.ctx.events.emit(
-            "stock.updated",
-            {
-                "product_id": 888,
-                "name": "TEST XPULSE EMIT",
-                "quantity_before": 20,
-                "quantity_after": 3,
-                "safety_stock": 10,
-            },
-        )
-        return {"status": "event_emitted_from_xpulse"}
+        return [ok(channels=ok_channels, failed=fail_channels)]
 
     # ── Actions IPC ───────────────────────────────────────────────────────
 
@@ -457,4 +304,26 @@ class Plugin(AutoDispatchMixin, RoutedPlugin, TrustedBase):
     # ── Router ────────────────────────────────────────────────────────────
 
     def get_router(self) -> Any | None:
-        return self.RouterIn()
+        return self.app
+
+    @health_check("xpulse.checker")
+    async def _redis_health_check(self):
+        if not self.redis_server:
+            return False, "Redis non configuré."
+        alive = await self.redis_server.health_check()
+        return alive, "Redis répond." if alive else "Redis ne répond pas."
+
+    async def _declare_rbac(self) -> None:
+        rbac = (self.ctx.config or {}).get("rbac") or {}
+        grants = rbac.get("grants") or []
+        if not grants:
+            return
+        try:
+            await self.ctx.events.emit(
+                "rbac.declare",
+                {"plugin": "xpulse", "grants": grants},
+                source="xpulse",
+            )
+            logger.info("[xpayproxy] rbac.declare émis (%d grant(s))", len(grants))
+        except Exception as exc:
+            logger.warning("[xpayproxy] rbac.declare ignoré : %s", exc)
