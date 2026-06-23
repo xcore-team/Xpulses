@@ -18,7 +18,7 @@ from xcore.sdk import (
     health_check,
     ok,
     on_event,
-    validate_payload,
+    schema,
 )
 
 from .bridge import register_bridge
@@ -33,36 +33,6 @@ from .routes import builder_router
 logger = logging.getLogger("xpulse.plugin")
 
 router = RouterRegistry()
-
-# ── Schémas IPC ───────────────────────────────────────────────────────────────
-
-_PUBLISH_SCHEMA = {
-    "channels": (list, ["notification"]),
-    "user_id": (str, ...),
-    "text": (str, ...),
-}
-
-_BROADCAST_SCHEMA = {
-    "channels": (list, ["notification"]),
-    "text": (str, ...),
-}
-
-_STREAM_SCHEMA = {
-    "channels": (list, ["notification"]),
-    "user_id": (str, ...),
-}
-
-_SUBSCRIBERS_SCHEMA = {
-    "channel": (str, ...),
-}
-
-_EMAIL_SCHEMAS = {
-    "to": (list, []),
-    "subject": (str, ...),
-    "template": (str, ...),
-    "html_parser": (bool, True),
-}
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PLUGIN PRINCIPAL
@@ -202,7 +172,13 @@ class Plugin(AutoDispatchMixin, EventMixin, ObservabilityMixin, TrustedBase):
     # ── Actions IPC ───────────────────────────────────────────────────────
 
     @action("xpulse.publish")
-    @validate_payload(_PUBLISH_SCHEMA, type_response="model", unset=False)
+    @schema(
+        version="1.0",
+        input={"channels": (list, ["notification"]), "user_id": (str, ...), "text": (str, ...)},
+        output={"channels": list, "failed": list},
+        type_response="model",
+        unset=False,
+    )
     async def ipc_publish(self, payload) -> dict:
         """
         Publie un message ciblé sur un ou plusieurs channels.
@@ -223,7 +199,13 @@ class Plugin(AutoDispatchMixin, EventMixin, ObservabilityMixin, TrustedBase):
         return ok(channels=[ch for ch in channels if ch not in failed], failed=failed)
 
     @action("xpulse.broadcast")
-    @validate_payload(_BROADCAST_SCHEMA, type_response="model", unset=False)
+    @schema(
+        version="1.0",
+        input={"channels": (list, ["notification"]), "text": (str, ...)},
+        output={"channels": list, "failed": list},
+        type_response="model",
+        unset=False,
+    )
     async def ipc_broadcast(self, payload) -> dict:
         """
         Broadcast un message à tous les abonnés des channels.
@@ -243,7 +225,13 @@ class Plugin(AutoDispatchMixin, EventMixin, ObservabilityMixin, TrustedBase):
         return ok(channels=[ch for ch in channels if ch not in failed], failed=failed)
 
     @action("xpulse.stream")
-    @validate_payload(_STREAM_SCHEMA, type_response="model", unset=False)
+    @schema(
+        version="1.0",
+        input={"channels": (list, ["notification"]), "user_id": (str, ...)},
+        output={"channels": list, "failed": list},
+        type_response="model",
+        unset=False,
+    )
     async def ipc_stream(self, payload) -> dict:
         """
         Publie un event de notification sur des channels pour un user donné.
@@ -264,7 +252,13 @@ class Plugin(AutoDispatchMixin, EventMixin, ObservabilityMixin, TrustedBase):
         return ok(channels=[ch for ch in channels if ch not in failed], failed=failed)
 
     @action("xpulse.subscribers")
-    @validate_payload(_SUBSCRIBERS_SCHEMA, type_response="model", unset=False)
+    @schema(
+        version="1.0",
+        input={"channel": (str, ...)},
+        output={"channel": str, "active_streams": int},
+        type_response="model",
+        unset=False,
+    )
     async def ipc_subscribers(self, payload) -> dict:
         """
         Retourne le nombre de streams actifs.
@@ -277,7 +271,13 @@ class Plugin(AutoDispatchMixin, EventMixin, ObservabilityMixin, TrustedBase):
         )
 
     @action("xpulse.email")
-    @validate_payload(_EMAIL_SCHEMAS, type_response="model", unset=False)
+    @schema(
+        version="1.0",
+        input={"to": (list, []), "subject": (str, ...), "template": (str, ...), "html_parser": (bool, True)},
+        output={"message": str},
+        type_response="model",
+        unset=False,
+    )
     async def send_and_forget_mail(self, payload):
         try:
             email = self.get_service("ext.email")
