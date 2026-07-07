@@ -9,7 +9,7 @@ from typing import Any
 def builder_router(svc:Any, caller:Any) -> APIRouter:
 
     router = APIRouter(tags=["xpulse"])
-    router.include_router(sse_routes(serice=svc, caller=caller))
+    router.include_router(sse_routes(svc, caller=caller))
 
     return router
 

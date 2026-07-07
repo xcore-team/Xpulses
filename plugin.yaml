@@ -13,11 +13,7 @@ requires:
 
 # ── Imports autorisés ────────────────────────────────────────────────────────
 allowed_imports:
-  # Web framework
   - fastapi
-  # Redis pub/sub asyncio
-  - redis
-  # Stdlib
   - asyncio
   - dataclasses
   - json
@@ -58,15 +54,7 @@ envconfiguration:
   inject: false
   env_file: .env
 
-env:
-  url: redis://localhost:6379/0
-  channel: ["notification", "systeme", "hunters", "alerts"]
-  MAX_CONCURRENT_STREAMS: 10
-  MAX_CHANNELS_PER_STREAM: 10
-  HEARTBEAT_INTERVAL: 10
-  MESSAGE_TIMEOUT: 10
-  RECONNECT_MAX_RETRIES: 10
-  RECONNECT_BASE_DELAY: 10
+env: {}
 
 rbac:
   grants:
@@ -75,7 +63,7 @@ rbac:
       tenant_grantable: false
       group: "notification"
 
-    - name: xpulse:tennant:publish
+    - name: xpulse:tenant:publish
       description: "Envoi d'une notification a tout les utilisateurs"
       tenant_grantable: true
       group: "notification"
@@ -85,7 +73,7 @@ rbac:
       tenant_grantable: false
       group: "notification"
 
-    - name: xpulse:tennant:broadcast
+    - name: xpulse:tenant:broadcast
       description: "Envoi d'une notification a tout les utilisateurs"
       tenant_grantable: true
       group: "notification"
