@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import html
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from xcore.kernel.api.rbac import get_current_user, require_permission
 from xcore.sdk import AuthPayload, error, get_logger, ok
 
-from ..utils import parse_channels, require_pubsub
+from ..utils import authorize_channels, is_broadcast_channel, parse_channels, require_pubsub
 
 if TYPE_CHECKING:
     from extensions.pubsub.service import PubSubClient
@@ -15,30 +17,34 @@ if TYPE_CHECKING:
 logger = get_logger("xpulses")
 
 
+# `user_id`/`text` en Body plutôt qu'en Query : une query string se retrouve
+# typiquement dans les logs d'accès serveur/proxy et l'historique
+# navigateur — un mauvais choix pour un identifiant utilisateur et un
+# contenu de notification pouvant porter des données personnelles (audit
+# XPulse Constat 7).
+class PublishBody(BaseModel):
+    user_id: str = Field(..., description="ID de l'utilisateur cible")
+    text: str = Field(..., description="Message à envoyer")
+    channels: list[str] = Field(default=["notification"])
+
+
+class BroadcastBody(BaseModel):
+    text: str = Field(..., description="Message à broadcaster")
+    channels: list[str] = Field(default=["notification"])
+
+
 def _extract_tenant_id(request: Request) -> str | None:
+    # Les deux seuls appelants (`publish_tenant`, `tenant_broadcast`)
+    # dépendent de `Depends(require_permission(...))`, qui pose
+    # `request.state.user` (vérifié RS256) avant l'exécution du corps de la
+    # route — le repli header `X-Tenant-Id` et le décodage JWT non vérifié
+    # étaient inatteignables en pratique, et l'import `jose` n'était même pas
+    # déclaré dans `allowed_imports`/`requirements.txt` (audit XPulse
+    # Constat 4). Supprimés.
     if hasattr(request.state, "user") and request.state.user:
         return request.state.user.get("tenant_id") or request.state.user.get(
             "user", {}
         ).get("tenant_id")
-
-    tenant_id = request.headers.get("X-Tenant-Id")
-    if tenant_id:
-        return tenant_id
-
-    auth = (
-        request.headers.get("Authorization")
-        or request.headers.get("authorization")
-        or ""
-    )
-    if auth.startswith("Bearer "):
-        token = auth[7:].strip()
-        if token:
-            try:
-                from jose import jwt as jose_jwt
-                claims = jose_jwt.get_unverified_claims(token)
-                return claims.get("tenant_id")
-            except Exception:
-                raise HTTPException(status_code=401, detail="Invalid token")
     return None
 
 
@@ -55,6 +61,8 @@ def sse_routes(svc: Any, caller: Any = None) -> APIRouter:
     ):
         _svc = require_pubsub(svc)
         _channels = parse_channels(channels)
+        authorize_channels(_channels, user)
+        _unfiltered = {ch for ch in _channels if is_broadcast_channel(ch)}
 
         pending = await _svc.flush_inbox(user["sub"])
 
@@ -64,14 +72,16 @@ def sse_routes(svc: Any, caller: Any = None) -> APIRouter:
             for msg in pending:
                 ch = msg.get("channel", "notification")
                 yield (f"event: {ch}\ndata: {_json.dumps(msg, ensure_ascii=False)}\n\n")
-            async for chunk in _svc.stream(channels=_channels, user_id=user["sub"]):
+            async for chunk in _svc.stream(
+                channels=_channels, user_id=user["sub"], unfiltered_channels=_unfiltered
+            ):
                 yield chunk
 
         return StreamingResponse(
             stream_with_inbox(),
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "redis",
+                "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
                 "Connection": "keep-alive",
             },
@@ -93,16 +103,14 @@ def sse_routes(svc: Any, caller: Any = None) -> APIRouter:
 
     @router.post("/publish", tags=["xpulse"])
     async def publish(
-        user_id: str = Query(..., description="ID de l'utilisateur cible"),
-        text: str = Query(..., description="Message à envoyer"),
-        channels: list[str] = Query(default=["notification"]),
+        body: PublishBody,
         _: AuthPayload = Depends(require_permission("xpulse:admin:publish")),
     ):
         redis = require_pubsub(svc)
-        parsed_channels = parse_channels(channels)
+        parsed_channels = parse_channels(body.channels)
 
         results = await redis.publish_many(
-            parsed_channels, {"user_id": user_id, "text": text}
+            parsed_channels, {"user_id": body.user_id, "text": html.escape(body.text)}
         )
         failed = [ch for ch, s in results.items() if not s]
         if failed:
@@ -115,13 +123,11 @@ def sse_routes(svc: Any, caller: Any = None) -> APIRouter:
     @router.post("/tenant/publish", tags=["xpulse"])
     async def publish_tenant(
         request: Request,
-        user_id: str = Query(..., description="ID de l'utilisateur cible"),
-        text: str = Query(..., description="Message à envoyer"),
-        channels: list[str] = Query(default=["notification"]),
+        body: PublishBody,
         _: AuthPayload = Depends(require_permission("xpulse:tenant:publish")),
     ):
         redis = require_pubsub(svc)
-        parsed_channels = parse_channels(channels)
+        parsed_channels = parse_channels(body.channels)
 
         if caller is None:
             raise HTTPException(
@@ -132,15 +138,20 @@ def sse_routes(svc: Any, caller: Any = None) -> APIRouter:
         users = (
             await caller("auth", "xauth.users.list.tenant", {"tenant_id": tenant_id})
         ).get("users", [])
-        if user_id not in users:
-            logger.warning(f"User {user_id} {users} {tenant_id}")
+        if body.user_id not in users:
+            # Pas de liste d'utilisateurs (PII : emails) en clair dans les
+            # logs — seul l'identifiant refusé et le tenant sont utiles au
+            # diagnostic (audit XPulse, dette technique « Logging de PII »).
+            logger.warning("Publish tenant refusé : user_id=%s tenant_id=%s", body.user_id, tenant_id)
+            # 403 (refus d'autorisation), pas 406 (négociation de contenu —
+            # sémantiquement incorrect ici, audit XPulse dette technique).
             raise HTTPException(
-                status_code=status.HTTP_406_NOT_ACCEPTABLE,
+                status_code=status.HTTP_403_FORBIDDEN,
                 detail="User not in your organization.",
             )
 
         results = await redis.publish_many(
-            parsed_channels, {"user_id": user_id, "text": text}
+            parsed_channels, {"user_id": body.user_id, "text": html.escape(body.text)}
         )
         failed = [ch for ch, s in results.items() if not s]
         if failed:
@@ -152,14 +163,13 @@ def sse_routes(svc: Any, caller: Any = None) -> APIRouter:
 
     @router.post("/broadcast", tags=["xpulse"])
     async def broadcast(
-        text: str = Query(..., description="Message à broadcaster"),
-        channels: list[str] = Query(default=["notification"]),
+        body: BroadcastBody,
         _: AuthPayload = Depends(require_permission("xpulse:admin:broadcast")),
     ):
         redis = require_pubsub(svc)
-        parsed_channels = parse_channels(channels)
+        parsed_channels = parse_channels(body.channels)
 
-        results = await redis.publish_many(parsed_channels, {"text": text})
+        results = await redis.publish_many(parsed_channels, {"text": html.escape(body.text)})
         failed = [ch for ch, s in results.items() if not s]
         if failed:
             raise HTTPException(
@@ -172,15 +182,14 @@ def sse_routes(svc: Any, caller: Any = None) -> APIRouter:
     @router.post("/tenant/broadcast", tags=["xpulse"])
     async def tenant_broadcast(
         request: Request,
-        text: str = Query(..., description="Message à broadcaster"),
-        channels: list[str] = Query(default=["notification"]),
+        body: BroadcastBody,
         _: AuthPayload = Depends(require_permission("xpulse:tenant:broadcast")),
     ):
         redis = require_pubsub(svc)
         tenant_id = _extract_tenant_id(request)
         channel = f"tenant-{tenant_id}"
 
-        response = await redis.publish(channel, {"text": text})
+        response = await redis.publish(channel, {"text": html.escape(body.text)})
         if not response:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,

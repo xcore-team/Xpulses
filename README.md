@@ -18,17 +18,21 @@ Le plugin se configure via le fichier `plugin.yaml` ou les variables d'environne
 |----------|-------------|---------|
 | `url` | URL de connexion Redis | `redis://localhost:6379/0` |
 | `channel` | Channels par défaut à écouter | `['notification', 'systeme', 'hunters']` |
-| `MAX_CONCURRENT_STREAMS` | Limite de connexions SSE simultanées | `1000` |
-| `MAX_CHANNELS_PER_STREAM`| Max de channels par connexion client | `20` |
-| `HEARTBEAT_INTERVAL` | Intervalle des pings SSE (secondes) | `15.0` |
+| `MAX_CONCURRENT_STREAMS` *(non implémenté)* | Limite de connexions SSE simultanées | — |
+| `MAX_CHANNELS_PER_STREAM` *(non implémenté)* | Max de channels par connexion client — `utils.validate_channels` applique déjà un plafond fixe de 20, non configurable | `20` (codé en dur) |
+| `HEARTBEAT_INTERVAL` *(non implémenté)* | Intervalle des pings SSE (secondes) — configurable via `RedisConfig.heartbeat`/`plugin.yaml`, pas par cette variable | — |
+
+> Ces variables (ainsi que `MESSAGE_TIMEOUT`, `RECONNECT_MAX_RETRIES`, `RECONNECT_BASE_DELAY`) décrivent un plan de configuration jamais câblé : `plugin.yaml` déclare `envconfiguration.inject: false` et aucune n'est lue dans `app/XPulses/src`. À implémenter ou retirer de la documentation.
 
 ## 📖 Utilisation API (REST/SSE)
 
 ### 1. Ouvrir un flux de notifications (SSE)
-**GET** `/stream/{user_id}?channels=chan1,chan2`
+**GET** `/stream?channels=chan1,chan2` — l'utilisateur est dérivé du JWT (`Authorization: Bearer ...`), pas d'un path param.
 
 ```javascript
-const src = new EventSource('/stream/user_123?channels=notification,alerts');
+const src = new EventSource('/stream?channels=notification,alerts', {
+    headers: { Authorization: `Bearer ${token}` },
+});
 
 src.addEventListener('notification', (e) => {
     const data = JSON.parse(e.data);
@@ -37,10 +41,10 @@ src.addEventListener('notification', (e) => {
 ```
 
 ### 2. Publier un message
-**POST** `/publish?user_id=...&text=...&channels=...`
+**POST** `/publish` — corps JSON `{"user_id": "...", "text": "...", "channels": [...]}`
 
 ### 3. Diffusion générale (Broadcast)
-**POST** `/broadcast?text=...&channels=...`
+**POST** `/broadcast` — corps JSON `{"text": "...", "channels": [...]}`
 
 ---
 

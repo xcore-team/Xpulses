@@ -4,6 +4,7 @@ xpulse/src/bridge/handlers.py — Pont de notifications inter-plugins (xauth).
 
 from __future__ import annotations
 
+import html
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,13 @@ logger = get_logger("xpulse.bridge")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
+
+# `text` est html.escape()-é avant publication : défense en profondeur, pas
+# une réponse à un XSS confirmé (aucun sink dangerouslySetInnerHTML/innerHTML
+# côté frontend actuel) — mais `text` interpole des champs semi-contrôlés
+# (email, slug, plan_id) et XPulse ne devrait pas faire reposer son intégrité
+# sur le fait qu'aucun consommateur, présent ou futur, ne rend jamais ce
+# contenu en HTML brut (audit XPulse Constat 5).
 
 
 def _tenant_channel(tenant_id: str) -> str:
@@ -36,7 +44,7 @@ async def _notify_user(
     try:
         await svc.publish(
             "notification",
-            {"user_id": user_id, "event_type": event_type, "text": text, **extra},
+            {"user_id": user_id, "event_type": event_type, "text": html.escape(text), **extra},
         )
     except Exception as exc:
         logger.warning("_notify_user(%s) échoué : %s", event_type, exc)
@@ -54,7 +62,7 @@ async def _notify_tenant(
     try:
         await svc.publish(
             _tenant_channel(tenant_id),
-            {"event_type": event_type, "text": text, "tenant_id": tenant_id, **extra},
+            {"event_type": event_type, "text": html.escape(text), "tenant_id": tenant_id, **extra},
         )
     except Exception as exc:
         logger.warning("_notify_tenant(%s) échoué : %s", event_type, exc)

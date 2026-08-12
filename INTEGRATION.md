@@ -106,28 +106,28 @@ data: {"channel": "notification", "user_id": "abc123", "text": "Bonjour"}
 
 ### `POST /publish`
 
-Publie un message ciblé vers un utilisateur précis.
+Publie un message ciblé vers un utilisateur précis. `POST /tenant/publish` a le même corps, restreint aux utilisateurs du tenant appelant.
 
-| Paramètre query | Type | Requis | Description |
+| Champ body (JSON) | Type | Requis | Description |
 |-----------------|------|--------|-------------|
 | `user_id` | `str` | oui | ID de l'utilisateur destinataire |
 | `text` | `str` | oui | Message à envoyer |
 | `channels` | `list[str]` | non | Channels cibles (défaut : `["notification"]`) |
 
-**Permission requise** : `xpulse:publish`
+**Permission requise** : `xpulse:admin:publish` (`/publish`) ou `xpulse:tenant:publish` (`/tenant/publish`)
 
 ---
 
 ### `POST /broadcast`
 
-Envoie un message à **tous** les abonnés d'un ou plusieurs channels.
+Envoie un message à **tous** les abonnés d'un ou plusieurs channels. `POST /tenant/broadcast` diffuse uniquement sur le canal `tenant-<tenant_id>` de l'appelant.
 
-| Paramètre query | Type | Requis | Description |
+| Champ body (JSON) | Type | Requis | Description |
 |-----------------|------|--------|-------------|
 | `text` | `str` | oui | Message à broadcaster |
-| `channels` | `list[str]` | non | Channels cibles (défaut : `["notification"]`) |
+| `channels` | `list[str]` | non | Channels cibles (défaut : `["notification"]`, ignoré par `/tenant/broadcast`) |
 
-**Permission requise** : `xpulse:broadcast`
+**Permission requise** : `xpulse:admin:broadcast` (`/broadcast`) ou `xpulse:tenant:broadcast` (`/tenant/broadcast`)
 
 ---
 
@@ -190,10 +190,15 @@ result = await ctx.actions.call("xpulse.subscribers", {
 
 ### Distinction publish / broadcast
 
-| Comportement | Condition |
+Le filtrage se fait **par canal d'écoute côté `/stream`**, pas par présence de `user_id` dans le message :
+
+| Canal écouté | Comportement |
 |---|---|
-| Notification ciblée | Le message contient `user_id` → livré uniquement à ce user |
-| Broadcast | Le message ne contient pas `user_id` → livré à tous les abonnés du channel |
+| `notification` (ou tout canal personnel) | Filtré : seuls les messages dont `user_id` correspond à l'abonné sont livrés |
+| `system`, `broadcast` | Diffusion globale : tout abonné authentifié reçoit tous les messages du canal |
+| `tenant-<tenant_id>` | Diffusion tenant : réservé aux membres de ce tenant (ou aux porteurs d'un grant `xpulse:admin:*`), tous les messages du canal leur sont livrés |
+
+Un message publié sur `system`/`broadcast`/`tenant-<id>` n'a donc pas besoin de porter `user_id` pour être livré — c'est le canal, pas le contenu du message, qui détermine la portée.
 
 ---
 
